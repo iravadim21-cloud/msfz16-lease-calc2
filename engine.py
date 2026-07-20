@@ -227,3 +227,203 @@ def build_monthly_summary(schedule_df):
         'rou_asset_end': 'ROU-актив на кінець періоду',
     })
     return grp
+
+
+# ---------------------------------------------------------------------------
+# Roll-forward ROU-активу та зобов'язання (річний розріз для примітки)
+# ---------------------------------------------------------------------------
+
+def _rollforward_for_period(sub):
+    """Рух зобов'язання та ROU-активу для підмножини рядків графіка (sub),
+    яка вже містить колонку 'ym' = calendar_year*12 + calendar_month.
+
+    Опорна тотожність (звіряється тестом нижче):
+        opening + additions + interest - payments == closing        (зобов'язання)
+        rou_opening + rou_additions - depreciation == rou_closing    (ROU-актив)
+    """
+    if sub.empty:
+        return None
+    first, last = sub['ym'].min(), sub['ym'].max()
+    is_new = sub['month_number'] == 1          # перший місяць договору = визнання
+    at_first = sub['ym'] == first
+    at_last = sub['ym'] == last
+    return {
+        'liability_opening': round(sub.loc[at_first & ~is_new, 'liability_balance_start'].sum(), 2),
+        'liability_additions': round(sub.loc[is_new, 'liability_balance_start'].sum(), 2),
+        'interest_charged': round(sub['interest_charged'].sum(), 2),
+        'payments': round(sub['payment_amount'].sum(), 2),
+        'liability_closing': round(sub.loc[at_last, 'liability_balance_end'].sum(), 2),
+        'rou_opening': round(sub.loc[at_first & ~is_new, 'rou_asset_start'].sum(), 2),
+        'rou_additions': round(sub.loc[is_new, 'rou_asset_start'].sum(), 2),
+        'depreciation': round(sub['depreciation'].sum(), 2),
+        'rou_closing': round(sub.loc[at_last, 'rou_asset_end'].sum(), 2),
+    }
+
+
+def build_annual_rollforward(schedule_df):
+    """Річний рух ROU-активу та зобов'язання з оренди по всьому портфелю —
+    та сама логіка, що й у 'Помісячно', але згорнута по календарних роках,
+    у форматі, придатному для примітки до фінзвітності."""
+    cols = ['Рік',
+            "Зобов'язання на початок року", "Визнано нових договорів (зобов'язання)",
+            'Нарахований відсоток за рік', 'Сплачено за рік', "Зобов'язання на кінець року",
+            'ROU-актив на початок року', 'Визнано нових договорів (ROU)',
+            'Амортизація ROU за рік', 'ROU-актив на кінець року']
+    if schedule_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = schedule_df.copy()
+    df['ym'] = df['calendar_year'] * 12 + df['calendar_month']
+
+    rows = []
+    for year in sorted(df['calendar_year'].unique()):
+        r = _rollforward_for_period(df[df['calendar_year'] == year])
+        if r is None:
+            continue
+        rows.append({
+            'Рік': int(year),
+            "Зобов'язання на початок року": r['liability_opening'],
+            "Визнано нових договорів (зобов'язання)": r['liability_additions'],
+            'Нарахований відсоток за рік': r['interest_charged'],
+            'Сплачено за рік': r['payments'],
+            "Зобов'язання на кінець року": r['liability_closing'],
+            'ROU-актив на початок року': r['rou_opening'],
+            'Визнано нових договорів (ROU)': r['rou_additions'],
+            'Амортизація ROU за рік': r['depreciation'],
+            'ROU-актив на кінець року': r['rou_closing'],
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ---------------------------------------------------------------------------
+# Примітка МСФЗ 16: аналіз строків погашення + зважені показники
+# ---------------------------------------------------------------------------
+
+MATURITY_COLS = ['До 1 року', 'Від 1 до 2 років', 'Від 2 до 3 років', 'Від 3 до 4 років',
+                  'Від 4 до 5 років', 'Понад 5 років', 'Разом недисконтовані платежі']
+
+
+def build_maturity_analysis(schedule_df, as_of_date):
+    """Недисконтовані майбутні орендні платежі за річними періодами,
+    станом на as_of_date (звітну дату) — стандартна таблиця аналізу
+    строків погашення зобов'язання з оренди за МСФЗ 16.93(б)."""
+    if schedule_df.empty:
+        return pd.DataFrame([[0.0] * 7], columns=MATURITY_COLS)
+
+    df = schedule_df.copy()
+    df['row_date'] = pd.to_datetime(dict(year=df['calendar_year'], month=df['calendar_month'], day=1))
+    as_of_ts = pd.Timestamp(as_of_date).replace(day=1)
+
+    future = df[(df['row_date'] >= as_of_ts) & (df['payment_amount'] > 0)]
+    if future.empty:
+        return pd.DataFrame([[0.0] * 7], columns=MATURITY_COLS)
+
+    months_ahead = (future['calendar_year'] - as_of_ts.year) * 12 + (future['calendar_month'] - as_of_ts.month)
+    bucket = (months_ahead // 12).clip(upper=5)
+    buckets = future.groupby(bucket)['payment_amount'].sum()
+
+    values = [round(float(buckets.get(i, 0.0)), 2) for i in range(6)]
+    values.append(round(sum(values), 2))
+    return pd.DataFrame([values], columns=MATURITY_COLS)
+
+
+def build_wam_stats(summary_df, schedule_df, as_of_date):
+    """Зважена середня ставка дисконтування і зважений середній строк, що
+    залишився (у місяцях), по договорах, активних станом на as_of_date.
+    Вага — початкове зобов'язання договору (initial_liability)."""
+    empty = {
+        'Звітна дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
+        'К-ть активних договорів': 0,
+        'Зважена середня ставка дисконтування, %': 0.0,
+        'Зважений середній строк, що залишився (міс.)': 0.0,
+    }
+    if schedule_df.empty or summary_df.empty:
+        return empty
+
+    df = schedule_df.copy()
+    df['row_date'] = pd.to_datetime(dict(year=df['calendar_year'], month=df['calendar_month'], day=1))
+    as_of_ts = pd.Timestamp(as_of_date).replace(day=1)
+
+    active_ids = df.loc[df['row_date'] == as_of_ts, 'contract_id'].unique()
+    if len(active_ids) == 0:
+        return empty
+
+    remaining_months = (
+        df[df['contract_id'].isin(active_ids) & (df['row_date'] >= as_of_ts)]
+        .groupby('contract_id')['row_date'].count()
+    )
+
+    s = summary_df.set_index('contract_id')
+    weights = s.loc[active_ids, 'initial_liability']
+    rates = s.loc[active_ids, 'discount_rate_percent']
+    total_w = weights.sum()
+    if total_w == 0:
+        return empty
+
+    wa_rate = (rates * weights).sum() / total_w
+    wa_term = (remaining_months.reindex(active_ids).fillna(0) * weights).sum() / total_w
+
+    return {
+        'Звітна дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
+        'К-ть активних договорів': int(len(active_ids)),
+        'Зважена середня ставка дисконтування, %': round(float(wa_rate), 2),
+        'Зважений середній строк, що залишився (міс.)': round(float(wa_term), 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Бухгалтерські проводки (журнал)
+# ---------------------------------------------------------------------------
+
+# УВАГА: рахунки орієнтовні (типовий План рахунків України) і НЕ ПІДТВЕРДЖЕНІ
+# клієнтом. Перед використанням проводок для імпорту в облікову систему —
+# узгодити коди рахунків з головним бухгалтером і за потреби передати
+# власний account_map у build_journal_entries().
+DEFAULT_ACCOUNT_MAP = {
+    'rou_asset': '109',              # Право користування активом (ROU)
+    'rou_amortization': '131',       # Знос (накопичена амортизація) ROU-активу
+    'lease_liability': '622',        # Зобов'язання з оренди
+    'interest_expense': '952',       # Фінансові витрати (проценти за зобов'язанням)
+    'amortization_expense': '943',   # Витрати на амортизацію ROU-активу
+    'cash': '311',                   # Поточний рахунок
+}
+
+JOURNAL_COLS = ['Період', 'Рік', 'Місяць', 'Зміст операції', 'Дебет', 'Кредит', 'Сума, грн']
+
+
+def build_journal_entries(schedule_df, account_map=None):
+    """Портфельні бухгалтерські проводки за кожен календарний місяць:
+    нарахування відсотка, амортизація ROU, сплата орендного платежу.
+    Деталізацію по кожному договору окремо дивись у вкладці «Графік»."""
+    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
+    if schedule_df.empty:
+        return pd.DataFrame(columns=JOURNAL_COLS)
+
+    grp = schedule_df.groupby(['calendar_year', 'calendar_month']).agg(
+        interest_charged=('interest_charged', 'sum'),
+        depreciation=('depreciation', 'sum'),
+        payment_amount=('payment_amount', 'sum'),
+    ).reset_index().sort_values(['calendar_year', 'calendar_month'])
+
+    rows = []
+    for _, r in grp.iterrows():
+        period = f"{MONTH_NAMES_UA[int(r['calendar_month'])]} {int(r['calendar_year'])}"
+        base = dict(Період=period, Рік=int(r['calendar_year']), Місяць=int(r['calendar_month']))
+
+        if r['interest_charged'] > 0:
+            rows.append({**base,
+                         'Зміст операції': "Нарахування відсотка за зобов'язанням з оренди",
+                         'Дебет': accounts['interest_expense'], 'Кредит': accounts['lease_liability'],
+                         'Сума, грн': round(float(r['interest_charged']), 2)})
+        if r['depreciation'] > 0:
+            rows.append({**base,
+                         'Зміст операції': 'Амортизація активу з права користування (ROU)',
+                         'Дебет': accounts['amortization_expense'], 'Кредит': accounts['rou_amortization'],
+                         'Сума, грн': round(float(r['depreciation']), 2)})
+        if r['payment_amount'] > 0:
+            rows.append({**base,
+                         'Зміст операції': 'Сплата орендного платежу',
+                         'Дебет': accounts['lease_liability'], 'Кредит': accounts['cash'],
+                         'Сума, грн': round(float(r['payment_amount']), 2)})
+
+    return pd.DataFrame(rows, columns=JOURNAL_COLS)
