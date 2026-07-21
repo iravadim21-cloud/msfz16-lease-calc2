@@ -227,6 +227,7 @@ def build_monthly_summary(schedule_df):
             "Зобов'язання на початок періоду", 'Нарахований відсоток',
             'Сплачено (грошовий потік)', 'Погашення тіла зобов\'язання',
             "Зобов'язання на кінець періоду",
+            'Короткострокова частина (до 12 міс.)', 'Довгострокова частина (понад 12 міс.)',
             'ROU-актив на початок періоду', 'Амортизація ROU-активу', 'ROU-актив на кінець періоду',
         ])
 
@@ -250,6 +251,38 @@ def build_monthly_summary(schedule_df):
     for c in num_cols:
         grp[c] = grp[c].round(2)
 
+    # Розбивка закриваючого залишку зобов'язання на коротко-/довгострокову
+    # частину по КОЖНОМУ періоду (не лише на звітну дату), тією ж логікою,
+    # що й build_liability_classification: для кожного договору, активного
+    # в періоді (Y, M), беремо ЙОГО закриваючий залишок через 12 місяців
+    # (0, якщо цей конкретний договір до того часу вже закінчився), і
+    # підсумовуємо по портфелю. Довгострокова = сума цих залишків;
+    # короткострокова = різниця із загальним закриваючим залишком періоду.
+    #
+    # ВАЖЛИВО: це НЕ те саме, що "закриваючий залишок портфеля через 12
+    # місяців" — портфель, що росте (нові договори з'являються з часом),
+    # у майбутньому періоді матиме БІЛЬШЕ активних договорів, ніж зараз, і
+    # проста різниця з майбутнім підсумком портфеля дала б від'ємну
+    # "короткострокову" частину. Тому рахуємо по кожному договору окремо.
+    sch = schedule_df.copy()
+    sch['ym'] = sch['calendar_year'] * 12 + sch['calendar_month']
+    future = sch[['contract_id', 'ym', 'liability_balance_end']].rename(
+        columns={'ym': 'future_ym', 'liability_balance_end': 'balance_future'})
+    sch['future_ym'] = sch['ym'] + 12
+    merged = sch.merge(future, on=['contract_id', 'future_ym'], how='left')
+    merged['balance_future'] = merged['balance_future'].fillna(0.0)
+    merged['long_term_row'] = merged['balance_future']
+    merged['short_term_row'] = merged['liability_balance_end'] - merged['balance_future']
+
+    split = merged.groupby(['calendar_year', 'calendar_month']).agg(
+        long_term=('long_term_row', 'sum'),
+        short_term=('short_term_row', 'sum'),
+    ).reset_index()
+    split['long_term'] = split['long_term'].round(2)
+    split['short_term'] = split['short_term'].round(2)
+
+    grp = grp.merge(split, on=['calendar_year', 'calendar_month'], how='left')
+
     grp.insert(0, 'Період', grp.apply(
         lambda r: f"{MONTH_NAMES_UA[int(r['calendar_month'])]} {int(r['calendar_year'])}", axis=1))
 
@@ -260,11 +293,20 @@ def build_monthly_summary(schedule_df):
         'payment_amount': 'Сплачено (грошовий потік)',
         'principal_repayment': "Погашення тіла зобов'язання",
         'liability_balance_end': "Зобов'язання на кінець періоду",
+        'short_term': 'Короткострокова частина (до 12 міс.)',
+        'long_term': 'Довгострокова частина (понад 12 міс.)',
         'rou_asset_start': 'ROU-актив на початок періоду',
         'depreciation': 'Амортизація ROU-активу',
         'rou_asset_end': 'ROU-актив на кінець періоду',
     })
-    return grp
+
+    cols_order = ['Період', 'Рік', 'Місяць', 'К-ть договорів у періоді',
+                  "Зобов'язання на початок періоду", 'Нарахований відсоток',
+                  'Сплачено (грошовий потік)', "Погашення тіла зобов'язання",
+                  "Зобов'язання на кінець періоду",
+                  'Короткострокова частина (до 12 міс.)', 'Довгострокова частина (понад 12 міс.)',
+                  'ROU-актив на початок періоду', 'Амортизація ROU-активу', 'ROU-актив на кінець періоду']
+    return grp[cols_order]
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +746,8 @@ def write_formula_schedule(writer, summary_df, schedule_df):
     SCH_COLS = ['unique_code', 'contract_id', 'lessor', 'month_number', 'calendar_year', 'calendar_month',
                 'total_months', 'monthly_rate', 'liability_balance_start', 'interest_charged',
                 'payment_amount', 'principal_repayment', 'liability_balance_end',
-                'rou_asset_start', 'depreciation', 'rou_asset_end']
+                'rou_asset_start', 'depreciation', 'rou_asset_end',
+                'liability_balance_end_in_12m']
     for c, name in enumerate(SCH_COLS):
         ws_sch.write(0, c, name, header_fmt)
     scol = {name: i for i, name in enumerate(SCH_COLS)}
@@ -786,6 +829,21 @@ def write_formula_schedule(writer, summary_df, schedule_df):
                 rr, scol['rou_asset_end'],
                 f"=IF({c_mn}={c_tm},0,ROUND({c_rs}-{c_dep},2))", money_fmt)
 
+            # Допоміжна колонка для розбивки короткострокова/довгострокова
+            # в 'Помісячно': залишок ЦЬОГО Ж договору через 12 місяців.
+            # Блок договору в 'Графік' іде рядок-за-рядком по month_number
+            # 1..total_months без пропусків, тому рядок "на рік пізніше"
+            # для того самого договору — це просто rr+12 у межах цього ж
+            # блоку (якщо він туди доходить), інакше — 0 (договір до того
+            # часу вже закінчився).
+            if j + 12 < n:
+                future_end_cell = xl_rowcol_to_cell(rr + 12, scol['liability_balance_end'])
+                ws_sch.write_formula(
+                    rr, scol['liability_balance_end_in_12m'],
+                    f"=IF({c_mn}+12<={c_tm},{future_end_cell},0)", money_fmt)
+            else:
+                ws_sch.write_number(rr, scol['liability_balance_end_in_12m'], 0.0, money_fmt)
+
         # ---- Summary: значення + формули ----
         ws_sum.write(r, col['unique_code'], srow['unique_code'])
         ws_sum.write(r, col['contract_id'], srow['contract_id'])
@@ -829,6 +887,19 @@ def write_formula_monthly_summary(writer, monthly_df, schedule_last_row):
     """Пише вкладку 'Помісячно' формулами SUMIFS, що тягнуть суми напряму
     з живої вкладки 'Графік' (яку вже записав write_formula_schedule) —
     портфельне зведення повністю простежується до першоджерела.
+
+    Короткострокова/довгострокова частина зобов'язання: довгострокова
+    частина періоду = SUMIFS допоміжної колонки 'Графік' —
+    liability_balance_end_in_12m (закриваючий залишок КОЖНОГО конкретного
+    договору, активного в цьому періоді, через 12 місяців; 0, якщо цей
+    договір до того часу вже закінчився). Це НЕ те саме, що закриваючий
+    залишок портфеля через 12 місяців — портфель, що росте (нові договори
+    з'являються з часом), у майбутньому періоді матиме більше активних
+    договорів, і проста різниця з майбутнім підсумком портфеля дала б
+    від'ємну "короткострокову" частину. Короткострокова = різниця із
+    загальним закриваючим залишком періоду (обидві — SUMIFS-комірки цього
+    ж рядка, тож це проста формула віднімання).
+
     schedule_last_row — індекс (0-based) останнього рядка з даними у 'Графік'."""
     workbook = writer.book
     ws = workbook.add_worksheet('Помісячно')
@@ -841,9 +912,11 @@ def write_formula_monthly_summary(writer, monthly_df, schedule_last_row):
             "Зобов'язання на початок періоду", 'Нарахований відсоток',
             'Сплачено (грошовий потік)', "Погашення тіла зобов'язання",
             "Зобов'язання на кінець періоду",
+            'Короткострокова частина (до 12 міс.)', 'Довгострокова частина (понад 12 міс.)',
             'ROU-актив на початок періоду', 'Амортизація ROU-активу', 'ROU-актив на кінець періоду']
     for c, name in enumerate(cols):
         ws.write(0, c, name, header_fmt)
+    ccol = {name: i for i, name in enumerate(cols)}
 
     if monthly_df.empty or schedule_last_row < 1:
         return
@@ -851,12 +924,15 @@ def write_formula_monthly_summary(writer, monthly_df, schedule_last_row):
     # Колонки 'Графік' (0-based): E=calendar_year(4), F=calendar_month(5),
     # I=liability_balance_start(8), J=interest_charged(9), K=payment_amount(10),
     # L=principal_repayment(11), M=liability_balance_end(12),
-    # N=rou_asset_start(13), O=depreciation(14), P=rou_asset_end(15)
+    # N=rou_asset_start(13), O=depreciation(14), P=rou_asset_end(15),
+    # Q=liability_balance_end_in_12m(16)
     sch_range = lambda col_idx: f"'Графік'!{xl_range(1, col_idx, schedule_last_row, col_idx)}"
     year_range = sch_range(4)
     month_range = sch_range(5)
 
-    sch_col_for_out_col = {4: 8, 5: 9, 6: 10, 7: 11, 8: 12, 9: 13, 10: 14, 11: 15}
+    # усі фінансові колонки — формулами SUMIFS напряму з 'Графік', включно
+    # з довгостроковою частиною (10 -> допоміжна колонка 16)
+    sch_col_for_out_col = {4: 8, 5: 9, 6: 10, 7: 11, 8: 12, 10: 16, 11: 13, 12: 14, 13: 15}
 
     for i, row in monthly_df.reset_index(drop=True).iterrows():
         r = i + 1
@@ -870,5 +946,9 @@ def write_formula_monthly_summary(writer, monthly_df, schedule_last_row):
         for out_col, sch_col in sch_col_for_out_col.items():
             formula = f"=ROUND(SUMIFS({sch_range(sch_col)},{year_range},{c_year},{month_range},{c_month}),2)"
             ws.write_formula(r, out_col, formula, money_fmt)
+
+        end_cell = xl_rowcol_to_cell(r, ccol["Зобов'язання на кінець періоду"])
+        long_cell = xl_rowcol_to_cell(r, ccol['Довгострокова частина (понад 12 міс.)'])
+        ws.write_formula(r, ccol['Короткострокова частина (до 12 міс.)'], f"={end_cell}-{long_cell}", money_fmt)
 
     ws.set_column(0, 0, 16)
