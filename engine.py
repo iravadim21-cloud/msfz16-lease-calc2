@@ -2,6 +2,11 @@
 IFRS16 (МСФЗ 16) batch lease amortization engine — перевикористовуваний модуль.
 Імпортується і з CLI-тесту, і з веб-інтерфейсу (app.py).
 
+Спрощена версія: рахує і виводить лише "Summary" (зведення по договорах),
+"Графік" (помісячна амортизація по кожному договору) і "Помісячно"
+(портфельне зведення по календарних місяцях). Інші звіти (roll-forward,
+примітка МСФЗ 16, класифікація 533/611, бухгалтерські проводки) прибрано.
+
 Припущення методології (підлягає підтвердженню клієнтом):
   - Річний платіж сплачується в річницю дати початку договору (постнумерандо).
   - Неповний перший/останній період (менше 12 міс.) — пропорційна частка річної суми.
@@ -252,12 +257,11 @@ def build_monthly_summary(schedule_df):
         grp[c] = grp[c].round(2)
 
     # Розбивка закриваючого залишку зобов'язання на коротко-/довгострокову
-    # частину по КОЖНОМУ періоду (не лише на звітну дату), тією ж логікою,
-    # що й build_liability_classification: для кожного договору, активного
-    # в періоді (Y, M), беремо ЙОГО закриваючий залишок через 12 місяців
-    # (0, якщо цей конкретний договір до того часу вже закінчився), і
-    # підсумовуємо по портфелю. Довгострокова = сума цих залишків;
-    # короткострокова = різниця із загальним закриваючим залишком періоду.
+    # частину по КОЖНОМУ періоду: для кожного договору, активного в періоді
+    # (Y, M), беремо ЙОГО закриваючий залишок через 12 місяців (0, якщо цей
+    # конкретний договір до того часу вже закінчився), і підсумовуємо по
+    # портфелю. Довгострокова = сума цих залишків; короткострокова —
+    # різниця із загальним закриваючим залишком періоду.
     #
     # ВАЖЛИВО: це НЕ те саме, що "закриваючий залишок портфеля через 12
     # місяців" — портфель, що росте (нові договори з'являються з часом),
@@ -307,331 +311,6 @@ def build_monthly_summary(schedule_df):
                   'Короткострокова частина (до 12 міс.)', 'Довгострокова частина (понад 12 міс.)',
                   'ROU-актив на початок періоду', 'Амортизація ROU-активу', 'ROU-актив на кінець періоду']
     return grp[cols_order]
-
-
-# ---------------------------------------------------------------------------
-# Roll-forward ROU-активу та зобов'язання (річний розріз для примітки)
-# ---------------------------------------------------------------------------
-
-def _rollforward_for_period(sub):
-    """Рух зобов'язання та ROU-активу для підмножини рядків графіка (sub),
-    яка вже містить колонку 'ym' = calendar_year*12 + calendar_month.
-
-    Опорна тотожність (звіряється тестом нижче):
-        opening + additions + interest - payments == closing        (зобов'язання)
-        rou_opening + rou_additions - depreciation == rou_closing    (ROU-актив)
-    """
-    if sub.empty:
-        return None
-    first, last = sub['ym'].min(), sub['ym'].max()
-    is_new = sub['month_number'] == 1          # перший місяць договору = визнання
-    at_first = sub['ym'] == first
-    at_last = sub['ym'] == last
-    return {
-        'liability_opening': round(sub.loc[at_first & ~is_new, 'liability_balance_start'].sum(), 2),
-        'liability_additions': round(sub.loc[is_new, 'liability_balance_start'].sum(), 2),
-        'interest_charged': round(sub['interest_charged'].sum(), 2),
-        'payments': round(sub['payment_amount'].sum(), 2),
-        'liability_closing': round(sub.loc[at_last, 'liability_balance_end'].sum(), 2),
-        'rou_opening': round(sub.loc[at_first & ~is_new, 'rou_asset_start'].sum(), 2),
-        'rou_additions': round(sub.loc[is_new, 'rou_asset_start'].sum(), 2),
-        'depreciation': round(sub['depreciation'].sum(), 2),
-        'rou_closing': round(sub.loc[at_last, 'rou_asset_end'].sum(), 2),
-    }
-
-
-def build_annual_rollforward(schedule_df):
-    """Річний рух ROU-активу та зобов'язання з оренди по всьому портфелю —
-    та сама логіка, що й у 'Помісячно', але згорнута по календарних роках,
-    у форматі, придатному для примітки до фінзвітності."""
-    cols = ['Рік',
-            "Зобов'язання на початок року", "Визнано нових договорів (зобов'язання)",
-            'Нарахований відсоток за рік', 'Сплачено за рік', "Зобов'язання на кінець року",
-            'ROU-актив на початок року', 'Визнано нових договорів (ROU)',
-            'Амортизація ROU за рік', 'ROU-актив на кінець року']
-    if schedule_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    df = schedule_df.copy()
-    df['ym'] = df['calendar_year'] * 12 + df['calendar_month']
-
-    rows = []
-    for year in sorted(df['calendar_year'].unique()):
-        r = _rollforward_for_period(df[df['calendar_year'] == year])
-        if r is None:
-            continue
-        rows.append({
-            'Рік': int(year),
-            "Зобов'язання на початок року": r['liability_opening'],
-            "Визнано нових договорів (зобов'язання)": r['liability_additions'],
-            'Нарахований відсоток за рік': r['interest_charged'],
-            'Сплачено за рік': r['payments'],
-            "Зобов'язання на кінець року": r['liability_closing'],
-            'ROU-актив на початок року': r['rou_opening'],
-            'Визнано нових договорів (ROU)': r['rou_additions'],
-            'Амортизація ROU за рік': r['depreciation'],
-            'ROU-актив на кінець року': r['rou_closing'],
-        })
-    return pd.DataFrame(rows, columns=cols)
-
-
-# ---------------------------------------------------------------------------
-# Примітка МСФЗ 16: аналіз строків погашення + зважені показники
-# ---------------------------------------------------------------------------
-
-def _as_of_ym(as_of_date):
-    """Звітна дата трактується як КІНЕЦЬ місяця, у якому вона знаходиться
-    (відповідає квартальним датам 31.03 / 30.06 / 30.09 / 31.12 — це вже
-    закритий місяць). Повертає ym = рік*12 + місяць цього місяця."""
-    ts = pd.Timestamp(as_of_date)
-    return ts.year * 12 + ts.month
-
-
-MATURITY_COLS = ['До 1 року', 'Від 1 до 2 років', 'Від 2 до 3 років', 'Від 3 до 4 років',
-                  'Від 4 до 5 років', 'Понад 5 років', 'Разом недисконтовані платежі']
-
-
-def build_maturity_analysis(schedule_df, as_of_date):
-    """Недисконтовані майбутні орендні платежі за річними періодами,
-    станом на as_of_date (звітну дату, трактується як кінець місяця —
-    напр. 31.03/30.06/30.09/31.12) — стандартна таблиця аналізу строків
-    погашення зобов'язання з оренди за МСФЗ 16.93(б).
-
-    Платіж місяця самої звітної дати вже врахований у закритому періоді
-    (він включений у закриваючий залишок на цю дату) і в "майбутні" не
-    потрапляє — рахуються лише платежі СТРОГО ПІСЛЯ звітного місяця."""
-    if schedule_df.empty:
-        return pd.DataFrame([[0.0] * 7], columns=MATURITY_COLS)
-
-    df = schedule_df.copy()
-    df['ym'] = df['calendar_year'] * 12 + df['calendar_month']
-    as_of_ym = _as_of_ym(as_of_date)
-
-    future = df[(df['ym'] > as_of_ym) & (df['payment_amount'] > 0)]
-    if future.empty:
-        return pd.DataFrame([[0.0] * 7], columns=MATURITY_COLS)
-
-    months_ahead = future['ym'] - as_of_ym  # 1, 2, 3, ... (місяців після звітної дати)
-    bucket = ((months_ahead - 1) // 12).clip(upper=5)
-    buckets = future.groupby(bucket)['payment_amount'].sum()
-
-    values = [round(float(buckets.get(i, 0.0)), 2) for i in range(6)]
-    values.append(round(sum(values), 2))
-    return pd.DataFrame([values], columns=MATURITY_COLS)
-
-
-def build_wam_stats(summary_df, schedule_df, as_of_date):
-    """Зважена середня ставка дисконтування і зважений середній строк, що
-    залишився (у місяцях), по договорах, активних станом на as_of_date
-    (трактується як кінець місяця). "Активний" = договір мав хоча б один
-    місяць у графіку в цьому звітному місяці. Строк, що залишився,
-    рахується від місяців СТРОГО ПІСЛЯ звітного (той місяць уже закрито).
-    Вага — початкове зобов'язання договору (initial_liability)."""
-    empty = {
-        'Звітна дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
-        'К-ть активних договорів': 0,
-        'Зважена середня ставка дисконтування, %': 0.0,
-        'Зважений середній строк, що залишився (міс.)': 0.0,
-    }
-    if schedule_df.empty or summary_df.empty:
-        return empty
-
-    df = schedule_df.copy()
-    df['ym'] = df['calendar_year'] * 12 + df['calendar_month']
-    as_of_ym = _as_of_ym(as_of_date)
-
-    active_ids = df.loc[df['ym'] == as_of_ym, 'contract_id'].unique()
-    if len(active_ids) == 0:
-        return empty
-
-    remaining_months = (
-        df[df['contract_id'].isin(active_ids) & (df['ym'] > as_of_ym)]
-        .groupby('contract_id')['ym'].count()
-    )
-
-    s = summary_df.set_index('contract_id')
-    weights = s.loc[active_ids, 'initial_liability']
-    rates = s.loc[active_ids, 'discount_rate_percent']
-    total_w = weights.sum()
-    if total_w == 0:
-        return empty
-
-    wa_rate = (rates * weights).sum() / total_w
-    wa_term = (remaining_months.reindex(active_ids).fillna(0) * weights).sum() / total_w
-
-    return {
-        'Звітна дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
-        'К-ть активних договорів': int(len(active_ids)),
-        'Зважена середня ставка дисконтування, %': round(float(wa_rate), 2),
-        'Зважений середній строк, що залишився (міс.)': round(float(wa_term), 1),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Бухгалтерські проводки (журнал)
-# ---------------------------------------------------------------------------
-
-# УВАГА: рахунки орієнтовні (типовий План рахунків України) і НЕ ПІДТВЕРДЖЕНІ
-# клієнтом. Перед використанням проводок для імпорту в облікову систему —
-# узгодити коди рахунків з головним бухгалтером і за потреби передати
-# власний account_map у build_journal_entries().
-DEFAULT_ACCOUNT_MAP = {
-    'rou_asset': '109',                    # Право користування активом (ROU)
-    'rou_amortization': '131',             # Знос (накопичена амортизація) ROU-активу
-    'lease_liability': '533',              # Контрольний рахунок зобов'язання з оренди
-                                            # (спрощення: нарахування % і платежі протягом
-                                            # року йдуть тут; на звітну дату частина, що
-                                            # підлягає погашенню протягом 12 міс., переноситься
-                                            # на 611 проводкою перекласифікації нижче)
-    'lease_liability_noncurrent': '533',   # Довгострокові зобов'язання з оренди
-    'lease_liability_current': '611',      # Поточна заборгованість за довгостроковими зобов'язаннями
-    'interest_expense': '952',             # Фінансові витрати (проценти за зобов'язанням)
-    'amortization_expense': '943',         # Витрати на амортизацію ROU-активу
-    'cash': '311',                         # Поточний рахунок
-}
-
-JOURNAL_COLS = ['Період', 'Рік', 'Місяць', 'Зміст операції', 'Дебет', 'Кредит', 'Сума, грн']
-
-
-def build_journal_entries(schedule_df, account_map=None):
-    """Портфельні бухгалтерські проводки за кожен календарний місяць:
-    нарахування відсотка, амортизація ROU, сплата орендного платежу.
-    Деталізацію по кожному договору окремо дивись у вкладці «Графік»."""
-    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
-    if schedule_df.empty:
-        return pd.DataFrame(columns=JOURNAL_COLS)
-
-    grp = schedule_df.groupby(['calendar_year', 'calendar_month']).agg(
-        interest_charged=('interest_charged', 'sum'),
-        depreciation=('depreciation', 'sum'),
-        payment_amount=('payment_amount', 'sum'),
-    ).reset_index().sort_values(['calendar_year', 'calendar_month'])
-
-    rows = []
-    for _, r in grp.iterrows():
-        period = f"{MONTH_NAMES_UA[int(r['calendar_month'])]} {int(r['calendar_year'])}"
-        base = dict(Період=period, Рік=int(r['calendar_year']), Місяць=int(r['calendar_month']))
-
-        if r['interest_charged'] > 0:
-            rows.append({**base,
-                         'Зміст операції': "Нарахування відсотка за зобов'язанням з оренди",
-                         'Дебет': accounts['interest_expense'], 'Кредит': accounts['lease_liability'],
-                         'Сума, грн': round(float(r['interest_charged']), 2)})
-        if r['depreciation'] > 0:
-            rows.append({**base,
-                         'Зміст операції': 'Амортизація активу з права користування (ROU)',
-                         'Дебет': accounts['amortization_expense'], 'Кредит': accounts['rou_amortization'],
-                         'Сума, грн': round(float(r['depreciation']), 2)})
-        if r['payment_amount'] > 0:
-            rows.append({**base,
-                         'Зміст операції': 'Сплата орендного платежу',
-                         'Дебет': accounts['lease_liability'], 'Кредит': accounts['cash'],
-                         'Сума, грн': round(float(r['payment_amount']), 2)})
-
-    return pd.DataFrame(rows, columns=JOURNAL_COLS)
-
-
-# ---------------------------------------------------------------------------
-# Класифікація зобов'язання: довгострокова (533) / короткострокова (611) частина
-# ---------------------------------------------------------------------------
-
-LIABILITY_CLASS_COLS = ['unique_code', 'contract_id', 'lessor',
-                         "Зобов'язання станом на звітну дату",
-                         'Прогнозний залишок через 12 міс.',
-                         'Короткострокова частина (до 12 міс.)', 'Рахунок (короткострокова)',
-                         'Довгострокова частина (понад 12 міс.)', 'Рахунок (довгострокова)']
-
-
-def build_liability_classification(schedule_df, as_of_date, account_map=None):
-    """Розподіл зобов'язання з оренди на довгострокову і короткострокову
-    частини станом на as_of_date, по кожному договору.
-
-    as_of_date трактується як КІНЕЦЬ місяця (напр. 31.03/30.06/30.09/31.12) —
-    тому за базу береться ЗАКРИВАЮЧИЙ залишок (liability_balance_end) місяця
-    звітної дати, а не залишок на його початок: до звітної дати нарахування
-    процента і платіж за цей місяць уже відбулись.
-
-    Короткострокова частина = сума погашення тіла зобов'язання, запланована
-    на найближчі 12 місяців ПІСЛЯ звітної дати (різниця між закриваючим
-    залишком на звітну дату і закриваючим залишком через 12 місяців).
-    Якщо договір закінчується раніше, ніж через 12 місяців — уся сума, що
-    залишилась, вважається короткостроковою.
-    """
-    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
-    if schedule_df.empty:
-        return pd.DataFrame(columns=LIABILITY_CLASS_COLS)
-
-    df = schedule_df.copy()
-    df['ym'] = df['calendar_year'] * 12 + df['calendar_month']
-    as_of_ym = _as_of_ym(as_of_date)
-    future_ym = as_of_ym + 12
-
-    now_rows = df[df['ym'] == as_of_ym]
-    if now_rows.empty:
-        return pd.DataFrame(columns=LIABILITY_CLASS_COLS)
-    now_rows = now_rows.set_index('contract_id')
-    future_rows = df[df['ym'] == future_ym].set_index('contract_id')
-    meta = df.drop_duplicates('contract_id').set_index('contract_id')[['unique_code', 'lessor']]
-
-    rows = []
-    for cid, r in now_rows.iterrows():
-        balance_now = float(r['liability_balance_end'])
-        balance_future = float(future_rows['liability_balance_end'].get(cid, 0.0))
-        short = round(balance_now - balance_future, 2)
-        long_ = round(balance_future, 2)
-        rows.append({
-            'unique_code': meta.loc[cid, 'unique_code'],
-            'contract_id': cid,
-            'lessor': meta.loc[cid, 'lessor'],
-            "Зобов'язання станом на звітну дату": round(balance_now, 2),
-            'Прогнозний залишок через 12 міс.': round(balance_future, 2),
-            'Короткострокова частина (до 12 міс.)': short,
-            'Рахунок (короткострокова)': accounts['lease_liability_current'],
-            'Довгострокова частина (понад 12 міс.)': long_,
-            'Рахунок (довгострокова)': accounts['lease_liability_noncurrent'],
-        })
-
-    result = pd.DataFrame(rows, columns=LIABILITY_CLASS_COLS).sort_values('unique_code').reset_index(drop=True)
-
-    totals = pd.DataFrame([{
-        'unique_code': '', 'contract_id': '', 'lessor': 'РАЗОМ ПО ПОРТФЕЛЮ',
-        "Зобов'язання станом на звітну дату": round(result["Зобов'язання станом на звітну дату"].sum(), 2),
-        'Прогнозний залишок через 12 міс.': round(result['Прогнозний залишок через 12 міс.'].sum(), 2),
-        'Короткострокова частина (до 12 міс.)': round(result['Короткострокова частина (до 12 міс.)'].sum(), 2),
-        'Рахунок (короткострокова)': accounts['lease_liability_current'],
-        'Довгострокова частина (понад 12 міс.)': round(result['Довгострокова частина (понад 12 міс.)'].sum(), 2),
-        'Рахунок (довгострокова)': accounts['lease_liability_noncurrent'],
-    }], columns=LIABILITY_CLASS_COLS)
-
-    return pd.concat([result, totals], ignore_index=True)
-
-
-def build_reclassification_entry(schedule_df, as_of_date, account_map=None):
-    """Проводка перекласифікації станом на звітну дату: частина зобов'язання,
-    яка підлягає погашенню протягом 12 місяців, переноситься з довгострокового
-    рахунка (533) на короткостроковий (611). Робиться раз на звітну дату
-    (за замовчуванням — портфельно, одним рядком)."""
-    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
-    cols = ['Дата', 'Зміст операції', 'Дебет', 'Кредит', 'Сума, грн']
-
-    classification_df = build_liability_classification(schedule_df, as_of_date, account_map)
-    if classification_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    total_short = classification_df.loc[
-        classification_df['lessor'] == 'РАЗОМ ПО ПОРТФЕЛЮ', 'Короткострокова частина (до 12 міс.)'
-    ].sum()
-    if total_short <= 0:
-        return pd.DataFrame(columns=cols)
-
-    return pd.DataFrame([{
-        'Дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
-        'Зміст операції': "Перекласифікація частини зобов'язання з оренди на поточну "
-                           "(підлягає погашенню протягом 12 міс. від звітної дати)",
-        'Дебет': accounts['lease_liability_noncurrent'],
-        'Кредит': accounts['lease_liability_current'],
-        'Сума, грн': round(float(total_short), 2),
-    }], columns=cols)
 
 
 # ---------------------------------------------------------------------------
@@ -701,20 +380,19 @@ def build_template_bytes():
 # ---------------------------------------------------------------------------
 #
 # За замовчуванням run_batch/calc_contract рахують все в Python і повертають
-# готові числа (summary_df/schedule_df/monthly_df) — так працює решта звітів
-# (Класифікація, Примітка МСФЗ 16, Проводки). Але для "Summary", "Графік" і
-# "Помісячно" є окремий режим виводу: замість готових чисел у клітинки
-# записуються Excel-формули, які аудитор може розкрити і перерахувати сам,
-# не довіряючи Python "наосліп".
+# готові числа (summary_df/schedule_df/monthly_df). Але для "Summary",
+# "Графік" і "Помісячно" є окремий режим виводу: замість готових чисел у
+# клітинки записуються Excel-формули, які аудитор може розкрити і
+# перерахувати сам, не довіряючи Python "наосліп".
 #
 # Перевірено (LibreOffice headless recalculation проти Python-еталону):
 # усі підсумкові величини (initial_liability, initial_rou_asset,
 # total_depreciation) збігаються ТОЧНО. У ланцюжку "залишок зобов'язання"
-# можливі поодинокі розбіжності до 1 копійки (~4% рядків) — це не помилка,
-# а різні алгоритми округлення: Python round() використовує банківське
-# округлення (до парного), Excel ROUND() завжди округляє від нуля. На суми
-# в тисячах/десятках тисяч грн це не впливає (нижче будь-якого порогу
-# суттєвості), але задокументовано тут явно, а не замовчується.
+# можливі поодинокі розбіжності до 1-2 копійок (~4% рядків) — це не
+# помилка, а різні алгоритми округлення: Python round() використовує
+# банківське округлення (до парного), Excel ROUND() завжди округляє від
+# нуля. На суми в тисячах/десятках тисяч грн це не впливає (нижче будь-якого
+# порогу суттєвості), але задокументовано тут явно, а не замовчується.
 
 from xlsxwriter.utility import xl_rowcol_to_cell, xl_range
 
