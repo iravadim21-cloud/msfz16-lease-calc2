@@ -14,7 +14,8 @@ import pandas as pd
 from engine import (
     load_rates, run_batch, validate_register, build_monthly_summary,
     build_annual_rollforward, build_maturity_analysis, build_wam_stats, build_journal_entries,
-    find_duplicate_contract_numbers, build_liability_classification, build_reclassification_entry,
+    find_duplicate_contract_numbers, find_duplicate_contract_codes,
+    build_liability_classification, build_reclassification_entry, build_template_bytes,
 )
 import datetime
 
@@ -49,15 +50,30 @@ if not check_password():
 st.title("Розрахунок оренди за МСФЗ 16")
 st.caption("Завантажте реєстр договорів → отримайте зведений розрахунок і графік ампортизації.")
 
-with st.expander("Формат реєстру (обов'язкові колонки)"):
+st.subheader("1. Заповніть цю таблицю")
+st.caption(
+    "Скачайте шаблон, заповніть його даними по кожному договору (видаліть рядок-приклад) "
+    "і завантажте назад нижче. Фіксовані колонки знижують ризик помилки в розрахунку."
+)
+st.download_button(
+    label="Скачати шаблон реєстру (Excel)",
+    data=build_template_bytes(),
+    file_name="Шаблон_реєстру_договорів.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+with st.expander("Опис колонок шаблону"):
     st.markdown(
-        "- **Номер договору**\n"
-        "- **ПІБ пайовика**\n"
-        "- **Дата початку оренди**\n"
-        "- **Дата закінчення оренди**\n"
-        "- **Сума оренди, грн** (річний платіж)"
+        "- **Код договору** — власний ідентифікатор (необов'язково; якщо не заповнити, "
+        "буде присвоєно автоматично)\n"
+        "- **Номер договору** — обов'язково\n"
+        "- **ПІБ пайовика** — обов'язково\n"
+        "- **Дата початку оренди** — обов'язково\n"
+        "- **Дата закінчення оренди** — обов'язково\n"
+        "- **Сума оренди, грн** (річний платіж) — обов'язково"
     )
 
+st.subheader("2. Завантажте заповнений реєстр")
 uploaded = st.file_uploader("Реєстр договорів (.xlsx)", type=["xlsx"])
 
 as_of_date = st.date_input(
@@ -87,7 +103,15 @@ if uploaded is not None:
         st.warning(
             "Номери договору повторюються в реєстрі: " + ", ".join(map(str, dup_numbers)) +
             ". Розрахунок все одно виконається — кожному рядку присвоюється власний "
-            "унікальний код (L-00001, L-00002, ...), але варто перевірити реєстр на помилки."
+            "унікальний код (з колонки «Код договору» або автоматично L-00001, L-00002, ...), "
+            "але варто перевірити реєстр на помилки."
+        )
+
+    dup_codes = find_duplicate_contract_codes(df)
+    if dup_codes:
+        st.warning(
+            "Значення в колонці «Код договору» повторюються: " + ", ".join(map(str, dup_codes)) +
+            ". Виправте, щоб коди справді ідентифікували договір однозначно."
         )
 
     if st.button("Розрахувати", type="primary"):
