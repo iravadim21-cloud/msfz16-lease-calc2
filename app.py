@@ -16,6 +16,7 @@ from engine import (
     build_annual_rollforward, build_maturity_analysis, build_wam_stats, build_journal_entries,
     find_duplicate_contract_numbers, find_duplicate_contract_codes,
     build_liability_classification, build_reclassification_entry, build_template_bytes,
+    write_formula_schedule, write_formula_monthly_summary,
 )
 import datetime
 
@@ -129,9 +130,11 @@ if uploaded is not None:
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                summary_df.to_excel(writer, sheet_name="Summary", index=False)
-                schedule_df.to_excel(writer, sheet_name="Графік", index=False)
-                monthly_df.to_excel(writer, sheet_name="Помісячно", index=False)
+                # Summary, Графік і Помісячно — на живих Excel-формулах (не готових
+                # значеннях), щоб аудитор міг розкрити будь-яку клітинку й перерахувати
+                # сам, а не вірити Python "наосліп". Перевірено LibreOffice recalculation.
+                write_formula_schedule(writer, summary_df, schedule_df)
+                write_formula_monthly_summary(writer, monthly_df, schedule_last_row=len(schedule_df))
 
                 annual_df.to_excel(writer, sheet_name="ROU та зобов'язання", index=False)
 
@@ -192,6 +195,12 @@ if uploaded is not None:
             st.caption("Перекласифікація на звітну дату:")
             st.dataframe(reclass_df, use_container_width=True)
 
+        st.caption(
+            "Вкладки «Summary», «Графік» і «Помісячно» у файлі Excel — на живих формулах "
+            "(не готових значеннях): будь-яку клітинку можна розкрити й перерахувати вручну. "
+            "Можливі поодинокі розбіжності до 1 копійки проти цифр вище — це різні алгоритми "
+            "округлення Python і Excel, на підсумкові суми не впливає."
+        )
         st.download_button(
             label="Завантажити повний розрахунок (Excel)",
             data=buffer,
