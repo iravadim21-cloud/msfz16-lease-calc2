@@ -67,8 +67,10 @@ def build_payment_schedule(annual_payment, months):
     return payments
 
 
-def calc_contract(row, rates):
+def calc_contract(row, rates, unique_code=None):
     contract_id = row['Номер договору']
+    if unique_code is None:
+        unique_code = str(contract_id)
     lessor = row['ПІБ пайовика']
     start_date = row['Дата початку оренди']
     end_date = row['Дата закінчення оренди']
@@ -127,7 +129,7 @@ def calc_contract(row, rates):
             dep = round(rou_balance, 2)
 
         schedule_rows.append({
-            'contract_id': contract_id, 'lessor': lessor,
+            'unique_code': unique_code, 'contract_id': contract_id, 'lessor': lessor,
             'month_number': m, 'calendar_year': cal_year, 'calendar_month': cal_month,
             'liability_balance_start': liab_balance, 'interest_charged': interest,
             'payment_amount': payment, 'principal_repayment': principal,
@@ -143,7 +145,7 @@ def calc_contract(row, rates):
             cal_year += 1
 
     summary_row = {
-        'contract_id': contract_id, 'lessor': lessor,
+        'unique_code': unique_code, 'contract_id': contract_id, 'lessor': lessor,
         'start_date': start_date.strftime('%d.%m.%Y'), 'end_date': end_date.strftime('%d.%m.%Y'),
         'term_category': {'short': 'До 1 року', 'mid': 'Від 1 до 5 років', 'long': 'Більше 5 років'}[category],
         'term_months': months, 'annual_payment': annual_payment,
@@ -161,15 +163,27 @@ def validate_register(df):
     return missing
 
 
+def find_duplicate_contract_numbers(df):
+    """Повертає список номерів договору ('Номер договору'), які зустрічаються
+    в реєстрі більше одного разу. Це не блокує розрахунок — кожному рядку
+    все одно присвоюється унікальний unique_code (L-00001, L-00002, ...),
+    але дублікати варто показати користувачу як попередження."""
+    if 'Номер договору' not in df.columns:
+        return []
+    counts = df['Номер договору'].value_counts()
+    return counts[counts > 1].index.tolist()
+
+
 def run_batch(df, rates):
     summaries, all_schedule, errors = [], [], []
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        unique_code = f"L-{i:05d}"
         try:
-            s, sch = calc_contract(row, rates)
+            s, sch = calc_contract(row, rates, unique_code=unique_code)
             summaries.append(s)
             all_schedule.extend(sch)
         except Exception as e:
-            errors.append({'contract_id': row.get('Номер договору'), 'error': str(e)})
+            errors.append({'unique_code': unique_code, 'contract_id': row.get('Номер договору'), 'error': str(e)})
     return pd.DataFrame(summaries), pd.DataFrame(all_schedule), pd.DataFrame(errors)
 
 
@@ -380,12 +394,18 @@ def build_wam_stats(summary_df, schedule_df, as_of_date):
 # узгодити коди рахунків з головним бухгалтером і за потреби передати
 # власний account_map у build_journal_entries().
 DEFAULT_ACCOUNT_MAP = {
-    'rou_asset': '109',              # Право користування активом (ROU)
-    'rou_amortization': '131',       # Знос (накопичена амортизація) ROU-активу
-    'lease_liability': '622',        # Зобов'язання з оренди
-    'interest_expense': '952',       # Фінансові витрати (проценти за зобов'язанням)
-    'amortization_expense': '943',   # Витрати на амортизацію ROU-активу
-    'cash': '311',                   # Поточний рахунок
+    'rou_asset': '109',                    # Право користування активом (ROU)
+    'rou_amortization': '131',             # Знос (накопичена амортизація) ROU-активу
+    'lease_liability': '533',              # Контрольний рахунок зобов'язання з оренди
+                                            # (спрощення: нарахування % і платежі протягом
+                                            # року йдуть тут; на звітну дату частина, що
+                                            # підлягає погашенню протягом 12 міс., переноситься
+                                            # на 611 проводкою перекласифікації нижче)
+    'lease_liability_noncurrent': '533',   # Довгострокові зобов'язання з оренди
+    'lease_liability_current': '611',      # Поточна заборгованість за довгостроковими зобов'язаннями
+    'interest_expense': '952',             # Фінансові витрати (проценти за зобов'язанням)
+    'amortization_expense': '943',         # Витрати на амортизацію ROU-активу
+    'cash': '311',                         # Поточний рахунок
 }
 
 JOURNAL_COLS = ['Період', 'Рік', 'Місяць', 'Зміст операції', 'Дебет', 'Кредит', 'Сума, грн']
@@ -427,3 +447,98 @@ def build_journal_entries(schedule_df, account_map=None):
                          'Сума, грн': round(float(r['payment_amount']), 2)})
 
     return pd.DataFrame(rows, columns=JOURNAL_COLS)
+
+
+# ---------------------------------------------------------------------------
+# Класифікація зобов'язання: довгострокова (533) / короткострокова (611) частина
+# ---------------------------------------------------------------------------
+
+LIABILITY_CLASS_COLS = ['unique_code', 'contract_id', 'lessor',
+                         "Зобов'язання станом на звітну дату",
+                         'Короткострокова частина (до 12 міс.)', 'Рахунок (короткострокова)',
+                         'Довгострокова частина (понад 12 міс.)', 'Рахунок (довгострокова)']
+
+
+def build_liability_classification(schedule_df, as_of_date, account_map=None):
+    """Розподіл зобов'язання з оренди на довгострокову і короткострокову
+    частини станом на as_of_date, по кожному договору.
+
+    Короткострокова частина = сума погашення тіла зобов'язання, запланована
+    на найближчі 12 місяців від звітної дати (стандартний підхід: різниця
+    між балансом на as_of_date і прогнозним балансом через 12 місяців).
+    Якщо договір закінчується раніше, ніж через 12 місяців — уся сума, що
+    залишилась, вважається короткостроковою.
+    """
+    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
+    if schedule_df.empty:
+        return pd.DataFrame(columns=LIABILITY_CLASS_COLS)
+
+    df = schedule_df.copy()
+    df['row_date'] = pd.to_datetime(dict(year=df['calendar_year'], month=df['calendar_month'], day=1))
+    as_of_ts = pd.Timestamp(as_of_date).replace(day=1)
+    future_ts = as_of_ts + pd.DateOffset(months=12)
+
+    now_rows = df[df['row_date'] == as_of_ts]
+    if now_rows.empty:
+        return pd.DataFrame(columns=LIABILITY_CLASS_COLS)
+    now_rows = now_rows.set_index('contract_id')
+    future_rows = df[df['row_date'] == future_ts].set_index('contract_id')
+    meta = df.drop_duplicates('contract_id').set_index('contract_id')[['unique_code', 'lessor']]
+
+    rows = []
+    for cid, r in now_rows.iterrows():
+        balance_now = float(r['liability_balance_start'])
+        balance_future = float(future_rows['liability_balance_start'].get(cid, 0.0))
+        short = round(balance_now - balance_future, 2)
+        long_ = round(balance_future, 2)
+        rows.append({
+            'unique_code': meta.loc[cid, 'unique_code'],
+            'contract_id': cid,
+            'lessor': meta.loc[cid, 'lessor'],
+            "Зобов'язання станом на звітну дату": round(balance_now, 2),
+            'Короткострокова частина (до 12 міс.)': short,
+            'Рахунок (короткострокова)': accounts['lease_liability_current'],
+            'Довгострокова частина (понад 12 міс.)': long_,
+            'Рахунок (довгострокова)': accounts['lease_liability_noncurrent'],
+        })
+
+    result = pd.DataFrame(rows, columns=LIABILITY_CLASS_COLS).sort_values('unique_code').reset_index(drop=True)
+
+    totals = pd.DataFrame([{
+        'unique_code': '', 'contract_id': '', 'lessor': 'РАЗОМ ПО ПОРТФЕЛЮ',
+        "Зобов'язання станом на звітну дату": round(result["Зобов'язання станом на звітну дату"].sum(), 2),
+        'Короткострокова частина (до 12 міс.)': round(result['Короткострокова частина (до 12 міс.)'].sum(), 2),
+        'Рахунок (короткострокова)': accounts['lease_liability_current'],
+        'Довгострокова частина (понад 12 міс.)': round(result['Довгострокова частина (понад 12 міс.)'].sum(), 2),
+        'Рахунок (довгострокова)': accounts['lease_liability_noncurrent'],
+    }], columns=LIABILITY_CLASS_COLS)
+
+    return pd.concat([result, totals], ignore_index=True)
+
+
+def build_reclassification_entry(schedule_df, as_of_date, account_map=None):
+    """Проводка перекласифікації станом на звітну дату: частина зобов'язання,
+    яка підлягає погашенню протягом 12 місяців, переноситься з довгострокового
+    рахунка (533) на короткостроковий (611). Робиться раз на звітну дату
+    (за замовчуванням — портфельно, одним рядком)."""
+    accounts = {**DEFAULT_ACCOUNT_MAP, **(account_map or {})}
+    cols = ['Дата', 'Зміст операції', 'Дебет', 'Кредит', 'Сума, грн']
+
+    classification_df = build_liability_classification(schedule_df, as_of_date, account_map)
+    if classification_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    total_short = classification_df.loc[
+        classification_df['lessor'] == 'РАЗОМ ПО ПОРТФЕЛЮ', 'Короткострокова частина (до 12 міс.)'
+    ].sum()
+    if total_short <= 0:
+        return pd.DataFrame(columns=cols)
+
+    return pd.DataFrame([{
+        'Дата': pd.Timestamp(as_of_date).strftime('%d.%m.%Y'),
+        'Зміст операції': "Перекласифікація частини зобов'язання з оренди на поточну "
+                           "(підлягає погашенню протягом 12 міс. від звітної дати)",
+        'Дебет': accounts['lease_liability_noncurrent'],
+        'Кредит': accounts['lease_liability_current'],
+        'Сума, грн': round(float(total_short), 2),
+    }], columns=cols)
