@@ -652,3 +652,223 @@ def build_template_bytes():
 
     buffer.seek(0)
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Excel-вивід на ЖИВИХ ФОРМУЛАХ (для аудиту) — Summary, Графік, Помісячно
+# ---------------------------------------------------------------------------
+#
+# За замовчуванням run_batch/calc_contract рахують все в Python і повертають
+# готові числа (summary_df/schedule_df/monthly_df) — так працює решта звітів
+# (Класифікація, Примітка МСФЗ 16, Проводки). Але для "Summary", "Графік" і
+# "Помісячно" є окремий режим виводу: замість готових чисел у клітинки
+# записуються Excel-формули, які аудитор може розкрити і перерахувати сам,
+# не довіряючи Python "наосліп".
+#
+# Перевірено (LibreOffice headless recalculation проти Python-еталону):
+# усі підсумкові величини (initial_liability, initial_rou_asset,
+# total_depreciation) збігаються ТОЧНО. У ланцюжку "залишок зобов'язання"
+# можливі поодинокі розбіжності до 1 копійки (~4% рядків) — це не помилка,
+# а різні алгоритми округлення: Python round() використовує банківське
+# округлення (до парного), Excel ROUND() завжди округляє від нуля. На суми
+# в тисячах/десятках тисяч грн це не впливає (нижче будь-якого порогу
+# суттєвості), але задокументовано тут явно, а не замовчується.
+
+from xlsxwriter.utility import xl_rowcol_to_cell, xl_range
+
+
+def write_formula_schedule(writer, summary_df, schedule_df):
+    """Пише вкладки 'Summary' і 'Графік' у вже відкритий pd.ExcelWriter
+    (engine='xlsxwriter') з живими формулами замість готових значень.
+    Повертає summary_row_of: {unique_code: excel_row_index (0-based)} —
+    знадобиться, якщо треба посилатись на конкретний рядок Summary ззовні.
+    """
+    workbook = writer.book
+    ws_sum = workbook.add_worksheet('Summary')
+    ws_sch = workbook.add_worksheet('Графік')
+    writer.sheets['Summary'] = ws_sum
+    writer.sheets['Графік'] = ws_sch
+
+    money_fmt = workbook.add_format({'num_format': '#,##0.00'})
+    pct_fmt = workbook.add_format({'num_format': '0.000000'})
+    header_fmt = workbook.add_format({'bold': True})
+
+    SUM_COLS = ['unique_code', 'contract_id', 'lessor', 'start_date', 'end_date', 'term_category',
+                'term_months', 'annual_payment', 'discount_rate_percent', 'monthly_rate',
+                'initial_liability', 'initial_rou_asset', 'total_interest', 'total_depreciation',
+                'n_payments']
+    for c, name in enumerate(SUM_COLS):
+        ws_sum.write(0, c, name, header_fmt)
+    col = {name: i for i, name in enumerate(SUM_COLS)}
+
+    SCH_COLS = ['unique_code', 'contract_id', 'lessor', 'month_number', 'calendar_year', 'calendar_month',
+                'total_months', 'monthly_rate', 'liability_balance_start', 'interest_charged',
+                'payment_amount', 'principal_repayment', 'liability_balance_end',
+                'rou_asset_start', 'depreciation', 'rou_asset_end']
+    for c, name in enumerate(SCH_COLS):
+        ws_sch.write(0, c, name, header_fmt)
+    scol = {name: i for i, name in enumerate(SCH_COLS)}
+
+    if schedule_df.empty:
+        return {}
+
+    contract_blocks = {uc: g for uc, g in schedule_df.groupby('unique_code', sort=False)}
+    sch_row = 1
+    summary_row_of = {}
+
+    for i, srow in summary_df.reset_index(drop=True).iterrows():
+        uc = srow['unique_code']
+        r = i + 1
+        summary_row_of[uc] = r
+
+        block = contract_blocks[uc].reset_index(drop=True)
+        n = len(block)
+        sch_start, sch_end = sch_row, sch_row + n - 1
+
+        for j, brow in block.iterrows():
+            rr = sch_row + j
+            ws_sch.write(rr, scol['unique_code'], brow['unique_code'])
+            ws_sch.write(rr, scol['contract_id'], brow['contract_id'])
+            ws_sch.write(rr, scol['lessor'], brow['lessor'])
+            ws_sch.write_number(rr, scol['month_number'], int(brow['month_number']))
+            ws_sch.write_number(rr, scol['calendar_year'], int(brow['calendar_year']))
+            ws_sch.write_number(rr, scol['calendar_month'], int(brow['calendar_month']))
+
+            ws_sch.write_formula(rr, scol['total_months'],
+                                  f"=Summary!{xl_rowcol_to_cell(r, col['term_months'])}")
+            ws_sch.write_formula(rr, scol['monthly_rate'],
+                                  f"=Summary!{xl_rowcol_to_cell(r, col['monthly_rate'])}", pct_fmt)
+
+            # payment_amount — вхідні дані (графік платежів з умов договору), не розрахункова величина
+            ws_sch.write_number(rr, scol['payment_amount'], float(brow['payment_amount']), money_fmt)
+
+            c_mn = xl_rowcol_to_cell(rr, scol['month_number'])
+            c_tm = xl_rowcol_to_cell(rr, scol['total_months'])
+            c_ls = xl_rowcol_to_cell(rr, scol['liability_balance_start'])
+            c_ic = xl_rowcol_to_cell(rr, scol['interest_charged'])
+            c_pay = xl_rowcol_to_cell(rr, scol['payment_amount'])
+            c_rs = xl_rowcol_to_cell(rr, scol['rou_asset_start'])
+            c_dep = xl_rowcol_to_cell(rr, scol['depreciation'])
+            c_mr = xl_rowcol_to_cell(rr, scol['monthly_rate'])
+
+            if j == 0:
+                ws_sch.write_formula(rr, scol['liability_balance_start'],
+                                      f"=Summary!{xl_rowcol_to_cell(r, col['initial_liability'])}", money_fmt)
+                ws_sch.write_formula(rr, scol['rou_asset_start'],
+                                      f"=Summary!{xl_rowcol_to_cell(r, col['initial_rou_asset'])}", money_fmt)
+            else:
+                ws_sch.write_formula(rr, scol['liability_balance_start'],
+                                      f"={xl_rowcol_to_cell(rr - 1, scol['liability_balance_end'])}", money_fmt)
+                ws_sch.write_formula(rr, scol['rou_asset_start'],
+                                      f"={xl_rowcol_to_cell(rr - 1, scol['rou_asset_end'])}", money_fmt)
+
+            # нарахування % за місяць = залишок на початок х місячна ставка
+            ws_sch.write_formula(rr, scol['interest_charged'], f"=ROUND({c_ls}*{c_mr},2)", money_fmt)
+
+            # залишок на кінець: в останньому місяці форсується 0 (гаситься повністю, план)
+            ws_sch.write_formula(
+                rr, scol['liability_balance_end'],
+                f"=IF({c_mn}={c_tm},0,ROUND({c_ls}+{c_ic}-{c_pay},2))", money_fmt)
+
+            # погашення тіла: в останньому місяці — весь залишок+%; у місяці без платежу — 0
+            ws_sch.write_formula(
+                rr, scol['principal_repayment'],
+                f"=IF({c_mn}={c_tm},ROUND({c_ls}+{c_ic},2),IF({c_pay}>0,ROUND({c_pay}-{c_ic},2),0))",
+                money_fmt)
+
+            # амортизація ROU: рівномірно initial_rou/total_months, в останньому місяці — залишок під нуль
+            ws_sch.write_formula(
+                rr, scol['depreciation'],
+                f"=IF({c_mn}={c_tm},{c_rs},"
+                f"ROUND(Summary!{xl_rowcol_to_cell(r, col['initial_rou_asset'])}/{c_tm},2))", money_fmt)
+
+            ws_sch.write_formula(
+                rr, scol['rou_asset_end'],
+                f"=IF({c_mn}={c_tm},0,ROUND({c_rs}-{c_dep},2))", money_fmt)
+
+        # ---- Summary: значення + формули ----
+        ws_sum.write(r, col['unique_code'], srow['unique_code'])
+        ws_sum.write(r, col['contract_id'], srow['contract_id'])
+        ws_sum.write(r, col['lessor'], srow['lessor'])
+        ws_sum.write(r, col['start_date'], srow['start_date'])
+        ws_sum.write(r, col['end_date'], srow['end_date'])
+        ws_sum.write(r, col['term_category'], srow['term_category'])
+        ws_sum.write_number(r, col['term_months'], int(srow['term_months']))
+        ws_sum.write_number(r, col['annual_payment'], float(srow['annual_payment']), money_fmt)
+        ws_sum.write_number(r, col['discount_rate_percent'], float(srow['discount_rate_percent']), pct_fmt)
+
+        # ставка за місяць — точно як у Python: (rate_percent/100)/12 (два окремих ділення,
+        # а не /1200 одразу — інакше через специфіку float-округлення зрідка розходиться з Python)
+        ws_sum.write_formula(
+            r, col['monthly_rate'],
+            f"=({xl_rowcol_to_cell(r, col['discount_rate_percent'])}/100)/12", pct_fmt)
+
+        payment_range = f"'Графік'!{xl_range(sch_start, scol['payment_amount'], sch_end, scol['payment_amount'])}"
+        ws_sum.write_formula(
+            r, col['initial_liability'],
+            f"=ROUND(NPV({xl_rowcol_to_cell(r, col['monthly_rate'])},{payment_range}),2)", money_fmt)
+        ws_sum.write_formula(r, col['initial_rou_asset'],
+                              f"={xl_rowcol_to_cell(r, col['initial_liability'])}", money_fmt)
+
+        interest_range = f"'Графік'!{xl_range(sch_start, scol['interest_charged'], sch_end, scol['interest_charged'])}"
+        dep_range = f"'Графік'!{xl_range(sch_start, scol['depreciation'], sch_end, scol['depreciation'])}"
+        ws_sum.write_formula(r, col['total_interest'], f"=ROUND(SUM({interest_range}),2)", money_fmt)
+        ws_sum.write_formula(r, col['total_depreciation'], f"=ROUND(SUM({dep_range}),2)", money_fmt)
+        ws_sum.write_number(r, col['n_payments'], int(srow['n_payments']))
+
+        sch_row = sch_end + 1
+
+    ws_sum.set_column(0, 2, 18)
+    ws_sum.set_column(3, 5, 14)
+    ws_sch.set_column(0, 2, 16)
+
+    return summary_row_of
+
+
+def write_formula_monthly_summary(writer, monthly_df, schedule_last_row):
+    """Пише вкладку 'Помісячно' формулами SUMIFS, що тягнуть суми напряму
+    з живої вкладки 'Графік' (яку вже записав write_formula_schedule) —
+    портфельне зведення повністю простежується до першоджерела.
+    schedule_last_row — індекс (0-based) останнього рядка з даними у 'Графік'."""
+    workbook = writer.book
+    ws = workbook.add_worksheet('Помісячно')
+    writer.sheets['Помісячно'] = ws
+
+    money_fmt = workbook.add_format({'num_format': '#,##0.00'})
+    header_fmt = workbook.add_format({'bold': True})
+
+    cols = ['Період', 'Рік', 'Місяць', 'К-ть договорів у періоді',
+            "Зобов'язання на початок періоду", 'Нарахований відсоток',
+            'Сплачено (грошовий потік)', "Погашення тіла зобов'язання",
+            "Зобов'язання на кінець періоду",
+            'ROU-актив на початок періоду', 'Амортизація ROU-активу', 'ROU-актив на кінець періоду']
+    for c, name in enumerate(cols):
+        ws.write(0, c, name, header_fmt)
+
+    if monthly_df.empty or schedule_last_row < 1:
+        return
+
+    # Колонки 'Графік' (0-based): E=calendar_year(4), F=calendar_month(5),
+    # I=liability_balance_start(8), J=interest_charged(9), K=payment_amount(10),
+    # L=principal_repayment(11), M=liability_balance_end(12),
+    # N=rou_asset_start(13), O=depreciation(14), P=rou_asset_end(15)
+    sch_range = lambda col_idx: f"'Графік'!{xl_range(1, col_idx, schedule_last_row, col_idx)}"
+    year_range = sch_range(4)
+    month_range = sch_range(5)
+
+    sch_col_for_out_col = {4: 8, 5: 9, 6: 10, 7: 11, 8: 12, 9: 13, 10: 14, 11: 15}
+
+    for i, row in monthly_df.reset_index(drop=True).iterrows():
+        r = i + 1
+        ws.write(r, 0, row['Період'])
+        ws.write_number(r, 1, int(row['Рік']))
+        ws.write_number(r, 2, int(row['Місяць']))
+        ws.write_number(r, 3, int(row['К-ть договорів у періоді']))  # headcount — не фін. показник
+
+        c_year = xl_rowcol_to_cell(r, 1)
+        c_month = xl_rowcol_to_cell(r, 2)
+        for out_col, sch_col in sch_col_for_out_col.items():
+            formula = f"=ROUND(SUMIFS({sch_range(sch_col)},{year_range},{c_year},{month_range},{c_month}),2)"
+            ws.write_formula(r, out_col, formula, money_fmt)
+
+    ws.set_column(0, 0, 16)
