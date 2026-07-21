@@ -14,6 +14,7 @@ import pandas as pd
 from engine import (
     load_rates, run_batch, validate_register, build_monthly_summary,
     build_annual_rollforward, build_maturity_analysis, build_wam_stats, build_journal_entries,
+    find_duplicate_contract_numbers, build_liability_classification, build_reclassification_entry,
 )
 import datetime
 
@@ -81,6 +82,14 @@ if uploaded is not None:
     st.success(f"Завантажено {len(df)} договорів.")
     st.dataframe(df.head(10), use_container_width=True)
 
+    dup_numbers = find_duplicate_contract_numbers(df)
+    if dup_numbers:
+        st.warning(
+            "Номери договору повторюються в реєстрі: " + ", ".join(map(str, dup_numbers)) +
+            ". Розрахунок все одно виконається — кожному рядку присвоюється власний "
+            "унікальний код (L-00001, L-00002, ...), але варто перевірити реєстр на помилки."
+        )
+
     if st.button("Розрахувати", type="primary"):
         with st.spinner(f"Рахую {len(df)} договорів..."):
             rates = load_rates(RATES_FILE)
@@ -91,6 +100,8 @@ if uploaded is not None:
             wam_stats = build_wam_stats(summary_df, schedule_df, as_of_date)
             wam_df = pd.DataFrame([wam_stats])
             journal_df = build_journal_entries(schedule_df)
+            classification_df = build_liability_classification(schedule_df, as_of_date)
+            reclass_df = build_reclassification_entry(schedule_df, as_of_date)
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -108,10 +119,16 @@ if uploaded is not None:
                 ws_note.write(4, 0, "Аналіз строків погашення зобов'язання з оренди "
                                      "(недисконтовані майбутні платежі)")
 
+                classification_df.to_excel(writer, sheet_name="Класифікація зобов'язання", index=False)
+
                 journal_df.to_excel(writer, sheet_name="Проводки", index=False)
+                ws_j = writer.sheets["Проводки"]
                 if not journal_df.empty:
-                    ws_j = writer.sheets["Проводки"]
                     ws_j.write(0, 7, "Рахунки орієнтовні — узгодити з бухгалтерією клієнта")
+                if not reclass_df.empty:
+                    reclass_row = len(journal_df) + 3
+                    ws_j.write(reclass_row - 1, 0, "Перекласифікація на звітну дату (533 → 611)")
+                    reclass_df.to_excel(writer, sheet_name="Проводки", index=False, startrow=reclass_row)
 
                 if not errors_df.empty:
                     errors_df.to_excel(writer, sheet_name="Помилки", index=False)
@@ -140,10 +157,16 @@ if uploaded is not None:
         st.dataframe(wam_df, use_container_width=True)
         st.dataframe(maturity_df, use_container_width=True)
 
+        st.subheader("Класифікація зобов'язання: короткострокова (611) / довгострокова (533)")
+        st.dataframe(classification_df, use_container_width=True)
+
         st.subheader("Бухгалтерські проводки")
         st.caption("Рахунки — орієнтовні, потребують узгодження з бухгалтерією клієнта "
                     "(див. ACCOUNT_MAP в engine.py).")
         st.dataframe(journal_df, use_container_width=True)
+        if not reclass_df.empty:
+            st.caption("Перекласифікація на звітну дату:")
+            st.dataframe(reclass_df, use_container_width=True)
 
         st.download_button(
             label="Завантажити повний розрахунок (Excel)",
